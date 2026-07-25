@@ -1,0 +1,20 @@
+{
+  "name": "fleet-rental-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ung dung quan ly cho thue xe: tinh chuyen, tinh ngay, chi phi hang thang, loi nhuan",
+  "scripts": {
+    "build": "npm install --prefix client && npm run build --prefix client",
+    "start": "node server/index.js",
+    "dev:server": "node server/index.js",
+    "dev:client": "npm run dev --prefix client"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.12.0",
+    "dotenv": "^16.4.5"
+  }
+}
