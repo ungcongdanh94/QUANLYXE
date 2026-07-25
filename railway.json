@@ -1,4 +1,0 @@
-# Railway se tu dong tao bien nay khi ban them Postgres plugin.
-# Chi can dat thu cong neu chay local.
-DATABASE_URL=postgresql://user:password@localhost:5432/fleetdb
-PORT=3000
