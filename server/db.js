@@ -1,5 +1,6 @@
 const { Pool } = require("pg");
 const crypto = require("crypto");
+const bcrypt = require("bcryptjs");
 
 if (!process.env.DATABASE_URL) {
   console.warn(
@@ -53,7 +54,33 @@ async function init() {
       note TEXT,
       created_at TIMESTAMPTZ DEFAULT now()
     );
+
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT DEFAULT 'staff',
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
   `);
+
+  const { rows: userCols } = await pool.query(`
+    SELECT column_name FROM information_schema.columns WHERE table_name = 'users'
+  `);
+  const userColNames = userCols.map((c) => c.column_name);
+  if (userColNames.length > 0 && !userColNames.includes("username")) {
+    console.log("==> Bang 'users' bi sai cau truc (thieu cot username), dang tao lai...");
+    await pool.query("DROP TABLE IF EXISTS users CASCADE");
+    await pool.query(`
+      CREATE TABLE users (
+        id TEXT PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT DEFAULT 'staff',
+        created_at TIMESTAMPTZ DEFAULT now()
+      )
+    `);
+  }
 
   const { rows } = await pool.query("SELECT COUNT(*)::int AS c FROM cars");
   if (rows[0].c === 0) {
@@ -63,6 +90,18 @@ async function init() {
         name,
       ]);
     }
+  }
+
+  const { rows: userRows } = await pool.query("SELECT COUNT(*)::int AS c FROM users");
+  if (userRows[0].c === 0) {
+    const hash = await bcrypt.hash("admin123", 10);
+    await pool.query(
+      "INSERT INTO users (id, username, password_hash, role) VALUES ($1,$2,$3,$4)",
+      [crypto.randomUUID(), "admin", hash, "admin"]
+    );
+    console.log(
+      "==> Da tao tai khoan mac dinh: username=admin  password=admin123 -- HAY DANG NHAP VA DOI MAT KHAU NGAY."
+    );
   }
 }
 
