@@ -1,62 +1,297 @@
-const jwt = require("jsonwebtoken");
+require("dotenv").config();
+const express = require("express");
+const path = require("path");
 const crypto = require("crypto");
+const cookieParser = require("cookie-parser");
+const bcrypt = require("bcryptjs");
+const { pool, init } = require("./db");
+const { signToken, setAuthCookie, clearAuthCookie, requireAuth, requireAdmin } = require("./auth");
 
-const SECRET =
-  process.env.JWT_SECRET ||
-  (() => {
-    console.warn(
-      "[canh bao] Chua dat JWT_SECRET. Dang dung khoa tam thoi - phien dang nhap se mat het khi server restart. " +
-        "Hay vao Railway > Variables > them JWT_SECRET (chuoi ngau nhien bat ky, cang dai cang tot)."
-    );
-    return crypto.randomBytes(32).toString("hex");
-  })();
+const app = express();
+app.use(express.json());
+app.use(cookieParser());
 
-const COOKIE_NAME = "fleet_token";
+const uid = () => crypto.randomUUID();
 
-function signToken(user) {
-  return jwt.sign(
-    { id: user.id, username: user.username, role: user.role },
-    SECRET,
-    { expiresIn: "30d" }
-  );
-}
-
-function setAuthCookie(res, token) {
-  res.cookie(COOKIE_NAME, token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
-    maxAge: 30 * 24 * 60 * 60 * 1000,
-  });
-}
-
-function clearAuthCookie(res) {
-  res.clearCookie(COOKIE_NAME);
-}
-
-function requireAuth(req, res, next) {
-  const token = req.cookies?.[COOKIE_NAME];
-  if (!token) return res.status(401).json({ error: "Chua dang nhap" });
+// ---------- AUTH (public routes) ----------
+app.post("/api/auth/login", async (req, res) => {
   try {
-    req.user = jwt.verify(token, SECRET);
-    next();
+    const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ error: "Thieu tai khoan hoac mat khau" });
+    const { rows } = await pool.query("SELECT * FROM users WHERE username=$1", [username]);
+    const user = rows[0];
+    if (!user) return res.status(401).json({ error: "Sai tai khoan hoac mat khau" });
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) return res.status(401).json({ error: "Sai tai khoan hoac mat khau" });
+    const token = signToken(user);
+    setAuthCookie(res, token);
+    res.json({ id: user.id, username: user.username, role: user.role });
   } catch (e) {
-    return res.status(401).json({ error: "Phien dang nhap khong hop le, hay dang nhap lai" });
+    res.status(500).json({ error: e.message });
   }
-}
+});
 
-function requireAdmin(req, res, next) {
-  if (req.user?.role !== "admin") {
-    return res.status(403).json({ error: "Chi tai khoan quan tri moi thuc hien duoc thao tac nay" });
+app.post("/api/auth/logout", (req, res) => {
+  clearAuthCookie(res);
+  res.json({ ok: true });
+});
+
+// Moi route /api ben duoi day deu yeu cau da dang nhap
+app.use("/api", requireAuth);
+
+app.get("/api/auth/me", (req, res) => {
+  res.json({ id: req.user.id, username: req.user.username, role: req.user.role });
+});
+
+app.post("/api/auth/change-password", async (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body;
+    if (!oldPassword || !newPassword) return res.status(400).json({ error: "Thieu thong tin" });
+    if (newPassword.length < 6) return res.status(400).json({ error: "Mat khau moi can it nhat 6 ky tu" });
+    const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [req.user.id]);
+    const user = rows[0];
+    const ok = await bcrypt.compare(oldPassword, user.password_hash);
+    if (!ok) return res.status(400).json({ error: "Mat khau cu khong dung" });
+    const hash = await bcrypt.hash(newPassword, 10);
+    await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2", [hash, req.user.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-  next();
-}
+});
 
-module.exports = {
-  signToken,
-  setAuthCookie,
-  clearAuthCookie,
-  requireAuth,
-  requireAdmin,
-  COOKIE_NAME,
-};
+// ---------- USER MANAGEMENT (chi admin) ----------
+app.get("/api/users", requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT id, username, role, created_at FROM users ORDER BY created_at"
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/users", requireAdmin, async (req, res) => {
+  try {
+    const { username, password, role } = req.body;
+    if (!username || !password) return res.status(400).json({ error: "Thieu tai khoan hoac mat khau" });
+    if (password.length < 6) return res.status(400).json({ error: "Mat khau can it nhat 6 ky tu" });
+    const hash = await bcrypt.hash(password, 10);
+    const id = uid();
+    await pool.query(
+      "INSERT INTO users (id, username, password_hash, role) VALUES ($1,$2,$3,$4)",
+      [id, username, hash, role === "admin" ? "admin" : "staff"]
+    );
+    res.json({ id, username, role: role === "admin" ? "admin" : "staff" });
+  } catch (e) {
+    if (e.code === "23505") return res.status(400).json({ error: "Ten tai khoan da ton tai" });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete("/api/users/:id", requireAdmin, async (req, res) => {
+  try {
+    if (req.user.id === req.params.id) {
+      return res.status(400).json({ error: "Khong the tu xoa tai khoan dang dung" });
+    }
+    await pool.query("DELETE FROM users WHERE id=$1", [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- CARS ----------
+app.get("/api/cars", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT id, name, plate FROM cars ORDER BY name");
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/cars", async (req, res) => {
+  try {
+    const { name, plate } = req.body;
+    if (!name) return res.status(400).json({ error: "Thieu ten xe" });
+    const id = uid();
+    await pool.query("INSERT INTO cars (id, name, plate) VALUES ($1,$2,$3)", [
+      id,
+      name,
+      plate || null,
+    ]);
+    res.json({ id, name, plate: plate || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete("/api/cars/:id", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM cars WHERE id=$1", [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- TRIPS ----------
+app.get("/api/trips", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, to_char(date,'YYYY-MM-DD') AS date, car_id AS "carId", customer,
+        revenue::float AS revenue, driver_cost::float AS "driverCost",
+        fuel_cost::float AS "fuelCost", other_cost::float AS "otherCost"
+      FROM trips ORDER BY date DESC, created_at DESC
+    `);
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/trips", async (req, res) => {
+  try {
+    const { date, carId, customer, revenue, driverCost, fuelCost, otherCost } = req.body;
+    const id = uid();
+    await pool.query(
+      `INSERT INTO trips (id, date, car_id, customer, revenue, driver_cost, fuel_cost, other_cost)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [id, date, carId || null, customer || null, revenue || 0, driverCost || 0, fuelCost || 0, otherCost || 0]
+    );
+    res.json({ id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put("/api/trips/:id", async (req, res) => {
+  try {
+    const { date, carId, customer, revenue, driverCost, fuelCost, otherCost } = req.body;
+    await pool.query(
+      `UPDATE trips SET date=$1, car_id=$2, customer=$3, revenue=$4, driver_cost=$5, fuel_cost=$6, other_cost=$7
+       WHERE id=$8`,
+      [date, carId || null, customer || null, revenue || 0, driverCost || 0, fuelCost || 0, otherCost || 0, req.params.id]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete("/api/trips/:id", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM trips WHERE id=$1", [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- DAILY RENTALS ----------
+app.get("/api/daily", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, to_char(date,'YYYY-MM-DD') AS date, car_id AS "carId", customer,
+        price_per_day::float AS "pricePerDay", days
+      FROM daily_rentals ORDER BY date DESC, created_at DESC
+    `);
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/daily", async (req, res) => {
+  try {
+    const { date, carId, customer, pricePerDay, days } = req.body;
+    const id = uid();
+    await pool.query(
+      `INSERT INTO daily_rentals (id, date, car_id, customer, price_per_day, days)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [id, date, carId || null, customer || null, pricePerDay || 0, days || 1]
+    );
+    res.json({ id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put("/api/daily/:id", async (req, res) => {
+  try {
+    const { date, carId, customer, pricePerDay, days } = req.body;
+    await pool.query(
+      `UPDATE daily_rentals SET date=$1, car_id=$2, customer=$3, price_per_day=$4, days=$5
+       WHERE id=$6`,
+      [date, carId || null, customer || null, pricePerDay || 0, days || 1, req.params.id]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete("/api/daily/:id", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM daily_rentals WHERE id=$1", [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- EXPENSES ----------
+app.get("/api/expenses", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, month, category, amount::float AS amount, note
+      FROM expenses ORDER BY month DESC, created_at DESC
+    `);
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/expenses", async (req, res) => {
+  try {
+    const { month, category, amount, note } = req.body;
+    const id = uid();
+    await pool.query(
+      `INSERT INTO expenses (id, month, category, amount, note) VALUES ($1,$2,$3,$4,$5)`,
+      [id, month, category || null, amount || 0, note || null]
+    );
+    res.json({ id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete("/api/expenses/:id", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM expenses WHERE id=$1", [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- Serve frontend build ----------
+const clientDist = path.join(__dirname, "..", "client", "dist");
+app.use(express.static(clientDist));
+app.get("*", (req, res) => {
+  res.sendFile(path.join(clientDist, "index.html"));
+});
+
+const PORT = process.env.PORT || 3000;
+
+init()
+  .then(() => {
+    app.listen(PORT, () => console.log(`Server dang chay tren port ${PORT}`));
+  })
+  .catch((err) => {
+    console.error("Khoi tao database that bai:", err);
+    process.exit(1);
+  });
